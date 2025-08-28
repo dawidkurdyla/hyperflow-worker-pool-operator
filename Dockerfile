@@ -1,7 +1,22 @@
-FROM python:3.7
-RUN pip install kopf
-RUN pip install kubernetes
-RUN pip install pyyaml
-CMD kopf run /src/handlers.py --verbose
-ADD templates /templates
-ADD handlers.py /src/handlers.py
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY handlers.py .
+COPY rabbitmq.py .
+COPY helpers ./helpers
+
+RUN pip install --no-cache-dir \
+    kopf \
+    kubernetes \
+    pyyaml \
+    requests
+
+CMD ["kopf", "run", "handlers.py", "--verbose"]
