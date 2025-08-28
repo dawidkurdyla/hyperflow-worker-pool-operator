@@ -21,12 +21,6 @@ spec:
       containers:
         - name: worker
           image: {image}
-          command:
-            - /usr/local/bin/dumb-init
-            - --single-child
-            - -v
-            - --
-            - hflow-job-listener.js
           env:
             - name: QUEUE_NAME
               value: {queueName}
@@ -76,6 +70,9 @@ spec:
           imagePullPolicy: Always
           resources:
             requests:
+              cpu: {cpuRequests}
+              memory: {memoryRequests}
+            limits:
               cpu: {cpuRequests}
               memory: {memoryRequests}
           volumeMounts:
