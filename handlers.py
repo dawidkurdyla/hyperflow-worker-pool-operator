@@ -1,11 +1,25 @@
+import os
 import kopf
 import kubernetes
 import yaml
 import logging
 import sys
 from os.path import exists
+from helpers.helpers_queue import resolve_queue
+from rabbitmq import RabbitAdmin
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+
+
+def rabbit_admin_from_env() -> RabbitAdmin:
+    api = os.getenv("RABBIT_API")
+    user = os.getenv("RABBIT_USER")
+    pwd  = os.getenv("RABBIT_PASS")
+    if not api or not user or not pwd:
+        raise kopf.TemporaryError("RABBIT_API/RABBIT_USER/RABBIT_PASS not configured", delay=30)
+    insecure = os.getenv("RABBIT_INSECURE", "0") == "1"
+    
+    return RabbitAdmin(api, user, pwd, verify=not insecure)
 
 
 class WorkerPool:
@@ -14,6 +28,7 @@ class WorkerPool:
         self.spec = spec
         self.name = name
         self.namespace = namespace
+
         self.min_replica_count = spec['minReplicaCount']
         self.image = spec['image']
         self.rabbitHostname = spec['rabbitHostname']
@@ -21,14 +36,19 @@ class WorkerPool:
         self.prometheusUrl = spec["prometheusUrl"]
         self.cpu_requests = spec['initialResources']['requests']['cpu']
         self.memory_requests = spec['initialResources']['requests']['memory']
-        self.queue_name = self.namespace + '.' + spec['taskType']
+
+        q = resolve_queue(spec)
+        self.queue_name = q['name']
+        self.queue_vhost = q['vhost']
+        self.queue_durable = q['durable']
+        self.queue_auto_delete = q['autoDelete']
+        self.queue_arguments = q['arguments']
+
         # optional
         self.max_replica_count = None
         self.cpu_limits = None
         self.memory_limits = None
 
-        if 'queueName' in spec:
-            self.queue_name = spec['queueName']
         if 'maxReplicaCount' in spec:
             self.max_replica_count = spec['maxReplicaCount']
         if 'limits' in spec['initialResources'] and 'cpu' in spec['initialResources']['limits']:
@@ -41,15 +61,16 @@ class WorkerPool:
 def configure(settings: kopf.OperatorSettings, **_):
     settings.posting.level = logging.INFO
     if not exists("/templates/deployment.yml"):
-        raise Exception("Initialization error: /templates/deployment.yml file not exists")
+        raise Exception("Initialization error: /templates/deployment.yml file does not exist")
     if not exists("/templates/prometheus-rule.yml"):
-        raise Exception("Initialization error: /templates/prometheusrule.yml file not exists")
+        raise Exception("Initialization error: /templates/prometheus-rule.yml file does not exist")
     if not exists("/templates/scaledobject.yml"):
-        raise Exception("Initialization error: /templates/scaledobject file not exists")
+        raise Exception("Initialization error: /templates/scaledobject.yml file does not exist")
+
 
 
 @kopf.on.create('hyperflow.agh.edu.pl', 'v1', 'workerpools')
-def create_fn(body, spec, **kwargs):
+def create_fn(body, spec, patch, **kwargs):
     k8s_client = kubernetes.client
     name = body['metadata']['name']
     namespace = body['metadata']['namespace']
@@ -58,6 +79,8 @@ def create_fn(body, spec, **kwargs):
     update_worker_pool_status(k8s_client, name, namespace, status)
     try:
         worker_pool = WorkerPool(name, namespace, spec)
+
+        create_worker_pool_queue(worker_pool)
         create_worker_pool_deployment(k8s_client, body, worker_pool)
         create_worker_pool_prometheusrule(k8s_client, body, worker_pool)
         create_worker_pool_scaledobject(k8s_client, body, worker_pool)
@@ -70,31 +93,40 @@ def create_fn(body, spec, **kwargs):
 
 
 @kopf.on.update('hyperflow.agh.edu.pl', 'v1', 'workerpools')
-def update_fn(spec, status, namespace, logger, **kwargs):
+def update_fn(spec, status, namespace, old, new, **kwargs):
     logging.info(f"Patch spec: {spec}")
     logging.info(f"Patch status: {status}")
 
     k8s_client = kubernetes.client
     name = status['workerPoolName']
 
-    status = {"status": {"conditions": [get_updating_condition()]}}
-    update_worker_pool_status(k8s_client, name, namespace, status)
+    status_patch = {"status": {"conditions": [get_updating_condition()]}}
+    update_worker_pool_status(k8s_client, name, namespace, status_patch)
     try:
         worker_pool = WorkerPool(name, namespace, spec)
+        old_spec = (old or {}).get('spec', {})
+
+        patch_worker_pool_queue(old_spec, worker_pool)
         patch_worker_pool_deployment(k8s_client, worker_pool)
         patch_worker_pool_prometheusrule(k8s_client, worker_pool)
         patch_worker_pool_scaledobject(k8s_client, worker_pool)
-        status['status']['conditions'] = [get_ready_condition()] + status['status']['conditions']
+
+        status_patch['status']['conditions'] = [get_ready_condition()] + status_patch['status']['conditions']
     except Exception as e:
         logging.exception(f"Worker pool {name} updating failed.")
-        status['status']['conditions'] = [get_error_condition(str(e))] + status['status']['conditions']
+        status_patch['status']['conditions'] = [get_error_condition(str(e))] + status_patch['status']['conditions']
     finally:
-        update_worker_pool_status(k8s_client, name, namespace, status)
+        update_worker_pool_status(k8s_client, name, namespace, status_patch)
 
 
-@kopf.on.create('hyperflow.agh.edu.pl', 'v1', 'workerpools')
-def delete(body, **kwargs):
-    logging.info(f"Deleting worker pool {body['metadata']['name']} and its children")
+@kopf.on.delete('hyperflow.agh.edu.pl', 'v1', 'workerpools')
+def delete(body, spec, **kwargs):
+    name = body['metadata']['name']
+    namespace = body['metadata']['namespace']
+    logging.info(f"Deleting worker pool {name} and its children")
+
+    worker_pool = WorkerPool(name, namespace, spec)
+    delete_worker_pool_queue(worker_pool)
 
 
 def create_worker_pool_deployment(k8s_client, body, worker_pool):
@@ -158,6 +190,46 @@ def patch_worker_pool_scaledobject(k8s_client, worker_pool):
                                                  plural="scaledobjects",
                                                  body={"spec": scaledobject['spec']})
     logging.info(f"ScaledObject {worker_pool.name} patched")
+
+
+def create_worker_pool_queue(worker_pool):
+    admin = rabbit_admin_from_env()
+    admin.ensure_queue(worker_pool.queue_vhost,
+                        worker_pool.queue_name,
+                        worker_pool.queue_durable,
+                        worker_pool.queue_auto_delete,
+                        worker_pool.queue_arguments)
+
+
+def patch_worker_pool_queue(old_spec, worker_pool):
+    admin = rabbit_admin_from_env()
+    old_q = resolve_queue(old_spec) if old_spec else None
+    new_q = {
+        "name": worker_pool.queue_name,
+        "vhost": worker_pool.queue_vhost,
+        "durable": worker_pool.queue_durable,
+        "autoDelete": worker_pool.queue_auto_delete,
+        "arguments": worker_pool.queue_arguments,
+    }
+    changed = (not old_q) or any(new_q[k] != old_q.get(k) for k in ("name", "vhost", "durable", "autoDelete", "arguments"))
+
+    if changed and old_q:
+        try:
+            admin.delete_queue(old_q["vhost"], old_q["name"])
+        except Exception as e:
+            logging.warning(f"Delete old queue failed: {e}")
+
+        admin.ensure_queue(new_q["vhost"], new_q["name"], new_q["durable"], new_q["autoDelete"], new_q["arguments"])
+
+
+def delete_worker_pool_queue(worker_pool):
+    admin = rabbit_admin_from_env()
+
+    try:
+        admin.delete_queue(worker_pool.queue_vhost, worker_pool.queue_name)
+    except Exception as e:
+        # Raising TemporaryError will keep the finalizer until RabbitMQ is reachable again
+        raise kopf.TemporaryError(f"Queue delete error: {e}", delay=30)
 
 
 def parse_deployment_template(worker_pool):
