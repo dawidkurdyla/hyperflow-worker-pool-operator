@@ -4,6 +4,7 @@ import kubernetes
 import yaml
 import logging
 import sys
+from copy import deepcopy
 from os.path import exists
 from helpers.helpers_queue import resolve_queue
 from rabbitmq import RabbitAdmin
@@ -20,6 +21,21 @@ def rabbit_admin_from_env() -> RabbitAdmin:
     insecure = os.getenv("RABBIT_INSECURE", "0") == "1"
     
     return RabbitAdmin(api, user, pwd, verify=not insecure)
+
+# Merge k8s EnvVar lists by name. Values from overrides win.
+def _merge_env(base_env, override_env):
+    base = [e for e in (base_env or []) if isinstance(e, dict) and e.get('name')]
+    over = [e for e in (override_env or []) if isinstance(e, dict) and e.get('name')]
+    by_name = {e['name']: e for e in base}
+    for e in over:
+        by_name[e['name']] = e
+
+    order = [e['name'] for e in base]
+    for e in over:
+        if e['name'] not in order:
+            order.append(e['name'])
+
+    return [by_name[n] for n in order]
 
 
 class WorkerPool:
@@ -48,6 +64,7 @@ class WorkerPool:
         self.max_replica_count = None
         self.cpu_limits = None
         self.memory_limits = None
+        self.env = spec.get('env', []) or []
 
         if 'maxReplicaCount' in spec:
             self.max_replica_count = spec['maxReplicaCount']
@@ -244,6 +261,15 @@ def parse_deployment_template(worker_pool):
                                       memoryRequests=worker_pool.memory_requests,
                                       minReplicas=worker_pool.min_replica_count)
         deployment = yaml.safe_load(template)
+
+        try:
+            container = deployment['spec']['template']['spec']['containers'][0]
+            base_env = container.get('env', [])
+            merged = _merge_env(base_env, worker_pool.env)
+            container['env'] = merged
+        except Exception as e:
+            logging.warning(f"env merge skipped: {e}")
+
         limits = {}
         if worker_pool.cpu_limits is not None:
             limits['cpu'] = worker_pool.cpu_limits

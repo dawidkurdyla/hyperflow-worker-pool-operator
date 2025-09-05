@@ -34,7 +34,13 @@ spec:
               value: /work_dir
             - name: HF_VAR_WAIT_FOR_INPUT_FILES
               value: "0"
+            - name: HF_VAR_USE_S3_IO
+              value: "0"
             - name: HF_VAR_NUM_RETRIES
+              value: "1"
+            - name: HF_AMQP_DECLARE_QUEUE
+              value: "0"
+            - name: HF_TASK_CLEANUP_LOCAL
               value: "1"
             - name: HF_LOG_NODE_NAME
               valueFrom:
